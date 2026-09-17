@@ -1,3 +1,5 @@
+![proxmox-gitops: Proxmox, Vault, Terraform, GitLab, Ansible](assets/banner.png)
+
 # proxmox-gitops
 
 A GitOps pipeline for provisioning and configuring VMs on Proxmox — fill out a
