@@ -112,4 +112,4 @@ notes) are in [SETUP.md](SETUP.md).
 
 ## License
 
-MIT (or your preferred license — add a LICENSE file before publishing).
+MIT — see [LICENSE](LICENSE).
