@@ -1,0 +1,30 @@
+- name: Manage user accounts
+  ansible.builtin.user:
+    name: "{{ item.name }}"
+    state: "{{ item.state }}"
+    groups: "{{ item.groups | default([]) }}"
+    shell: "{{ item.shell | default('/bin/bash') }}"
+    create_home: "{{ item.state == 'present' }}"
+    remove: "{{ item.state == 'absent' }}"
+  loop: "{{ managed_users }}"
+
+- name: Set SSH authorized keys
+  ansible.posix.authorized_key:
+    user: "{{ item.name }}"
+    state: present
+    key: "{{ user_ssh_keys[item.name] }}"
+  loop: "{{ managed_users }}"
+  when:
+    - item.state == 'present'
+    - item.name in user_ssh_keys
+
+- name: Configure sudo access
+  ansible.builtin.template:
+    src: sudoers.j2
+    dest: "/etc/sudoers.d/{{ item.name }}"
+    validate: "visudo -cf %s"
+    mode: '0440'
+  loop: "{{ managed_users }}"
+  when:
+    - item.state == 'present'
+    - item.sudo_nopasswd | default(false)

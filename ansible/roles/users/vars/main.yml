@@ -1,0 +1,16 @@
+# Users managed on every provisioned VM.
+# Each user's SSH public key must exist in Vault at secret/users/<name>
+# AND the name must be in the user fetch list in .gitlab-ci.yml
+# (ansible:configure before_script).
+managed_users:
+  - name: admin
+    state: present
+    groups: [sudo, docker]
+    shell: /bin/bash
+    sudo_nopasswd: true
+
+  - name: deployer
+    state: present
+    groups: [docker]
+    shell: /bin/bash
+    sudo_nopasswd: false

@@ -1,0 +1,12 @@
+profile: production
+
+exclude_paths:
+  - ansible/inventory/
+
+warn_list:
+  - yaml[line-length]
+  - name[casing]
+
+skip_list:
+  - no-changed-when   # we use creates: for idempotency in the docker role
+  - var-naming[no-role-prefix]

@@ -1,0 +1,22 @@
+- name: Configure VM
+  hosts: all
+  become: true
+  gather_facts: false
+
+  # pre_tasks always run BEFORE roles. Roles need facts (os_family etc.),
+  # so connection wait + fact gathering must happen here, not in tasks.
+  pre_tasks:
+    - name: Wait for connection
+      ansible.builtin.wait_for_connection:
+        delay: 10
+        timeout: 300
+        sleep: 5
+
+    - name: Gather facts
+      ansible.builtin.setup:
+
+  roles:
+    - base
+    - docker             # creates the docker group
+    - qemu_guest_agent   # needs facts from pre_tasks
+    - users              # can now add users to the docker group

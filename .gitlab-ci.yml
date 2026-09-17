@@ -1,0 +1,579 @@
+spec:
+  inputs:
+    action:
+      description: "What to do: apply creates the VM, destroy removes it"
+      options:
+        - "apply"
+        - "destroy"
+      default: "apply"
+    vm_name:
+      description: "Name for the VM (e.g. test-vm-01)"
+      default: "test-vm-"
+    vm_ip:
+      description: "Static IP with CIDR (e.g. 192.168.1.50/24)"
+      default: "192.168.1.x/24"
+    vm_gateway:
+      description: "Default gateway for the VM subnet"
+      default: "192.168.1.1"
+    template_vm_id:
+      description: "Proxmox template VM ID (numeric, e.g. 9000)"
+      default: "9000"
+    proxmox_node:
+      description: "Target Proxmox node"
+      default: "pve"
+    vm_id:
+      description: "Proxmox VM ID (0 = auto-assign)"
+      default: "0"
+    vlan_id:
+      description: "VLAN tag (0 = untagged)"
+      default: "0"
+
+---
+
+variables:
+  TF_ROOT: ${CI_PROJECT_DIR}/environments/general
+  TF_STATE_NAME: general
+  ANSIBLE_ROOT: ${CI_PROJECT_DIR}/ansible
+  ANSIBLE_HOST_KEY_CHECKING: "False"
+  ANSIBLE_FORCE_COLOR: "True"
+  ACTION: $[[ inputs.action ]]
+
+stages:
+  - build
+  - validate
+  - plan
+  - apply
+  - configure
+  - destroy
+
+# ── Image builds ─────────────────────────────────────────────────────────────
+# Only run on push when the Dockerfiles change. Requires the runner to have
+# privileged = true for docker:dind. If your runner uses network_mode = "host",
+# build images locally instead (see README) — dind port binding will conflict.
+
+build:ansible-image:
+  stage: build
+  image: docker:latest
+  tags: [proxmox]
+  services:
+    - docker:dind
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_HOST: tcp://docker:2375
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker build -t $CI_REGISTRY_IMAGE/ansible:latest docker/ansible/
+    - docker push $CI_REGISTRY_IMAGE/ansible:latest
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+      changes:
+        - docker/ansible/Dockerfile
+
+build:terraform-image:
+  stage: build
+  image: docker:latest
+  tags: [proxmox]
+  services:
+    - docker:dind
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_HOST: tcp://docker:2375
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker build -t $CI_REGISTRY_IMAGE/terraform:latest docker/terraform/
+    - docker push $CI_REGISTRY_IMAGE/terraform:latest
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+      changes:
+        - docker/terraform/Dockerfile
+
+# ── Shared Terraform config ──────────────────────────────────────────────────
+# Every Terraform job authenticates to Vault via GitLab's JWT (id_tokens).
+# No long-lived credentials are stored anywhere in CI.
+
+.tf_base:
+  image:
+    name: $CI_REGISTRY_IMAGE/terraform:latest
+    entrypoint: [""]
+  tags: [proxmox]
+  id_tokens:
+    VAULT_ID_TOKEN:
+      aud: "${VAULT_ADDR}"
+  variables:
+    VAULT_ROLE: gitlab-terraform
+    TF_HTTP_USERNAME: "gitlab-ci-token"
+    TF_HTTP_PASSWORD: "$CI_JOB_TOKEN"
+    TF_HTTP_ADDRESS: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/terraform/state/${TF_STATE_NAME}"
+    TF_HTTP_LOCK_ADDRESS: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/terraform/state/${TF_STATE_NAME}/lock"
+    TF_HTTP_UNLOCK_ADDRESS: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/terraform/state/${TF_STATE_NAME}/lock"
+    TF_HTTP_LOCK_METHOD: "POST"
+    TF_HTTP_UNLOCK_METHOD: "DELETE"
+  before_script:
+    - |
+      export VAULT_TOKEN=$(curl -s \
+        --request POST \
+        --header "Content-Type: application/json" \
+        --data "{\"role\":\"${VAULT_ROLE}\",\"jwt\":\"${VAULT_ID_TOKEN}\"}" \
+        "${VAULT_ADDR}/v1/auth/jwt/login" \
+        | grep -o '"client_token":"[^"]*"' | cut -d'"' -f4)
+      if [ -z "$VAULT_TOKEN" ]; then
+        echo "ERROR: Failed to obtain Vault token"
+        exit 1
+      fi
+      echo "Vault auth successful"
+    - cd ${TF_ROOT}
+    - terraform init
+
+# ── Validate stage (runs on every push) ──────────────────────────────────────
+
+tf:validate:
+  extends: .tf_base
+  stage: validate
+  script:
+    - terraform validate
+  after_script:
+    - |
+      if [ "$CI_JOB_STATUS" != "success" ]; then
+        curl -s -X POST "${SLACK_STATUS_WEBHOOK_URL}" \
+          -H "Content-Type: application/json" \
+          -d "{
+            \"blocks\": [
+              {
+                \"type\": \"header\",
+                \"text\": {\"type\": \"plain_text\", \"text\": \"❌ Terraform Validate Failed\"}
+              },
+              {
+                \"type\": \"section\",
+                \"fields\": [
+                  {\"type\": \"mrkdwn\", \"text\": \"*Branch:*\n${CI_COMMIT_REF_NAME}\"},
+                  {\"type\": \"mrkdwn\", \"text\": \"*Triggered by:*\n${GITLAB_USER_LOGIN}\"}
+                ]
+              },
+              {
+                \"type\": \"section\",
+                \"text\": {\"type\": \"mrkdwn\", \"text\": \"<${CI_PROJECT_URL}/-/jobs/${CI_JOB_ID}|View logs>\"}
+              }
+            ]
+          }"
+      fi
+  rules:
+    - when: always
+
+tf:fmt:
+  extends: .tf_base
+  stage: validate
+  script:
+    - terraform fmt -check -recursive ${CI_PROJECT_DIR}
+  after_script:
+    - |
+      if [ "$CI_JOB_STATUS" != "success" ]; then
+        curl -s -X POST "${SLACK_STATUS_WEBHOOK_URL}" \
+          -H "Content-Type: application/json" \
+          -d "{
+            \"blocks\": [
+              {
+                \"type\": \"header\",
+                \"text\": {\"type\": \"plain_text\", \"text\": \"❌ Terraform Format Check Failed\"}
+              },
+              {
+                \"type\": \"section\",
+                \"text\": {\"type\": \"mrkdwn\", \"text\": \"One or more \`.tf\` files are not properly formatted.\nRun \`terraform fmt -recursive\` locally and push again.\"}
+              },
+              {
+                \"type\": \"section\",
+                \"fields\": [
+                  {\"type\": \"mrkdwn\", \"text\": \"*Branch:*\n${CI_COMMIT_REF_NAME}\"},
+                  {\"type\": \"mrkdwn\", \"text\": \"*Triggered by:*\n${GITLAB_USER_LOGIN}\"}
+                ]
+              },
+              {
+                \"type\": \"section\",
+                \"text\": {\"type\": \"mrkdwn\", \"text\": \"<${CI_PROJECT_URL}/-/jobs/${CI_JOB_ID}|View logs>\"}
+              }
+            ]
+          }"
+      fi
+  rules:
+    - when: always
+
+ansible:lint:
+  stage: validate
+  image: $CI_REGISTRY_IMAGE/ansible:latest
+  tags: [proxmox]
+  script:
+    - cd ${ANSIBLE_ROOT}
+    - ansible-lint --config-file ${CI_PROJECT_DIR}/.ansible-lint playbook.yml
+  after_script:
+    - |
+      if [ "$CI_JOB_STATUS" != "success" ]; then
+        curl -s -X POST "${SLACK_STATUS_WEBHOOK_URL}" \
+          -H "Content-Type: application/json" \
+          -d "{
+            \"blocks\": [
+              {
+                \"type\": \"header\",
+                \"text\": {\"type\": \"plain_text\", \"text\": \"❌ Ansible Lint Failed\"}
+              },
+              {
+                \"type\": \"section\",
+                \"text\": {\"type\": \"mrkdwn\", \"text\": \"Playbook or role has linting errors. Fix before apply will be allowed.\"}
+              },
+              {
+                \"type\": \"section\",
+                \"fields\": [
+                  {\"type\": \"mrkdwn\", \"text\": \"*Branch:*\n${CI_COMMIT_REF_NAME}\"},
+                  {\"type\": \"mrkdwn\", \"text\": \"*Triggered by:*\n${GITLAB_USER_LOGIN}\"}
+                ]
+              },
+              {
+                \"type\": \"section\",
+                \"text\": {\"type\": \"mrkdwn\", \"text\": \"<${CI_PROJECT_URL}/-/jobs/${CI_JOB_ID}|View logs>\"}
+              }
+            ]
+          }"
+      fi
+  rules:
+    - when: always
+
+# ── Plan / Apply (web-triggered, action=apply) ───────────────────────────────
+
+tf:plan:
+  extends: .tf_base
+  stage: plan
+  needs: [tf:validate, tf:fmt]
+  script:
+    - |
+      terraform plan -no-color -out=tfplan \
+        -var="vm_name=$[[ inputs.vm_name ]]" \
+        -var="vm_ip=$[[ inputs.vm_ip ]]" \
+        -var="vm_gateway=$[[ inputs.vm_gateway ]]" \
+        -var="template_vm_id=$[[ inputs.template_vm_id ]]" \
+        -var="proxmox_node=$[[ inputs.proxmox_node ]]" \
+        -var="vm_id=$[[ inputs.vm_id ]]" \
+        -var="vlan_id=$[[ inputs.vlan_id ]]" \
+        2>&1 | tee /tmp/plan_output.txt
+    - |
+      PLAN_SUMMARY=$(grep -E "^Plan:|No changes\." /tmp/plan_output.txt \
+        || echo "See pipeline for details")
+      PIPELINE_URL="${CI_PROJECT_URL}/-/pipelines/${CI_PIPELINE_ID}"
+      curl -s -X POST "${SLACK_WEBHOOK_URL}" \
+        -H "Content-Type: application/json" \
+        -d "{
+          \"blocks\": [
+            {
+              \"type\": \"header\",
+              \"text\": {\"type\": \"plain_text\", \"text\": \"🔍 Terraform Plan Ready for Review\"}
+            },
+            {
+              \"type\": \"section\",
+              \"fields\": [
+                {\"type\": \"mrkdwn\", \"text\": \"*VM:*\n$[[ inputs.vm_name ]] ($[[ inputs.vm_ip ]])\"},
+                {\"type\": \"mrkdwn\", \"text\": \"*Node:*\n$[[ inputs.proxmox_node ]]\"},
+                {\"type\": \"mrkdwn\", \"text\": \"*VLAN:*\n$[[ inputs.vlan_id ]]\"},
+                {\"type\": \"mrkdwn\", \"text\": \"*Triggered by:*\n${GITLAB_USER_LOGIN}\"}
+              ]
+            },
+            {
+              \"type\": \"section\",
+              \"text\": {\"type\": \"mrkdwn\", \"text\": \"*Plan Summary:*\n\`\`\`${PLAN_SUMMARY}\`\`\`\"}
+            },
+            {
+              \"type\": \"section\",
+              \"text\": {\"type\": \"mrkdwn\", \"text\": \"*Action required:* <${PIPELINE_URL}|Review plan and approve apply>\"}
+            }
+          ]
+        }"
+  after_script:
+    - |
+      if [ "$CI_JOB_STATUS" != "success" ]; then
+        curl -s -X POST "${SLACK_STATUS_WEBHOOK_URL}" \
+          -H "Content-Type: application/json" \
+          -d "{
+            \"blocks\": [
+              {
+                \"type\": \"header\",
+                \"text\": {\"type\": \"plain_text\", \"text\": \"❌ Terraform Plan Failed\"}
+              },
+              {
+                \"type\": \"section\",
+                \"fields\": [
+                  {\"type\": \"mrkdwn\", \"text\": \"*VM:*\n$[[ inputs.vm_name ]]\"},
+                  {\"type\": \"mrkdwn\", \"text\": \"*Triggered by:*\n${GITLAB_USER_LOGIN}\"}
+                ]
+              },
+              {
+                \"type\": \"section\",
+                \"text\": {\"type\": \"mrkdwn\", \"text\": \"<${CI_PROJECT_URL}/-/jobs/${CI_JOB_ID}|View job logs>\"}
+              }
+            ]
+          }"
+      fi
+  artifacts:
+    paths:
+      - ${TF_ROOT}/tfplan
+    expire_in: 1 day
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web" && $ACTION == "apply"'
+      when: always
+
+tf:apply:
+  extends: .tf_base
+  stage: apply
+  needs:
+    - job: tf:plan
+      artifacts: true
+  script:
+    - terraform apply tfplan
+    - terraform output -raw vm_ip > ${CI_PROJECT_DIR}/vm_ip.txt
+  after_script:
+    - |
+      if [ "$CI_JOB_STATUS" = "success" ]; then
+        EMOJI="✅"
+        TITLE="Terraform Apply Succeeded"
+        VM_IP=$(cat ${CI_PROJECT_DIR}/vm_ip.txt 2>/dev/null || echo "unknown")
+        DETAIL="*VM \`$[[ inputs.vm_name ]]\` is live at \`${VM_IP}\`*\nAnsible configuration is now running."
+      else
+        EMOJI="❌"
+        TITLE="Terraform Apply Failed"
+        DETAIL="VM \`$[[ inputs.vm_name ]]\` was not created. <${CI_PROJECT_URL}/-/jobs/${CI_JOB_ID}|View logs>"
+      fi
+      curl -s -X POST "${SLACK_STATUS_WEBHOOK_URL}" \
+        -H "Content-Type: application/json" \
+        -d "{
+          \"blocks\": [
+            {
+              \"type\": \"header\",
+              \"text\": {\"type\": \"plain_text\", \"text\": \"${EMOJI} ${TITLE}\"}
+            },
+            {
+              \"type\": \"section\",
+              \"fields\": [
+                {\"type\": \"mrkdwn\", \"text\": \"*VM:*\n$[[ inputs.vm_name ]]\"},
+                {\"type\": \"mrkdwn\", \"text\": \"*Node:*\n$[[ inputs.proxmox_node ]]\"},
+                {\"type\": \"mrkdwn\", \"text\": \"*Triggered by:*\n${GITLAB_USER_LOGIN}\"},
+                {\"type\": \"mrkdwn\", \"text\": \"*Pipeline:*\n<${CI_PROJECT_URL}/-/pipelines/${CI_PIPELINE_ID}|#${CI_PIPELINE_ID}>\"}
+              ]
+            },
+            {
+              \"type\": \"section\",
+              \"text\": {\"type\": \"mrkdwn\", \"text\": \"${DETAIL}\"}
+            }
+          ]
+        }"
+  artifacts:
+    paths:
+      - vm_ip.txt
+    expire_in: 1 day
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web" && $ACTION == "apply"'
+      when: manual
+
+# ── Configure (Ansible) ──────────────────────────────────────────────────────
+
+ansible:configure:
+  stage: configure
+  image: $CI_REGISTRY_IMAGE/ansible:latest
+  tags: [proxmox]
+  needs:
+    - job: tf:apply
+      artifacts: true
+    - job: ansible:lint
+      artifacts: false
+  id_tokens:
+    VAULT_ID_TOKEN:
+      aud: "${VAULT_ADDR}"
+  variables:
+    VAULT_ROLE: gitlab-ansible
+  before_script:
+    - |
+      export VAULT_TOKEN=$(curl -s \
+        --request POST \
+        --header "Content-Type: application/json" \
+        --data "{\"role\":\"${VAULT_ROLE}\",\"jwt\":\"${VAULT_ID_TOKEN}\"}" \
+        "${VAULT_ADDR}/v1/auth/jwt/login" \
+        | grep -o '"client_token":"[^"]*"' | cut -d'"' -f4)
+      if [ -z "$VAULT_TOKEN" ]; then
+        echo "ERROR: Failed to obtain Vault token"
+        exit 1
+      fi
+      echo "Vault auth successful"
+    - |
+      python3 -c "
+      import hvac, os
+      client = hvac.Client(url=os.environ['VAULT_ADDR'], token=os.environ['VAULT_TOKEN'])
+      secret = client.secrets.kv.v2.read_secret_version(path='ansible', mount_point='secret')
+      print(secret['data']['data']['ssh_private_key'], end='')
+      " > /tmp/ansible_key
+    - chmod 600 /tmp/ansible_key
+    - |
+      python3 -c "
+      import hvac, os, json
+      client = hvac.Client(url=os.environ['VAULT_ADDR'], token=os.environ['VAULT_TOKEN'])
+      keys = {}
+      for user in ['admin', 'deployer']:
+          try:
+              secret = client.secrets.kv.v2.read_secret_version(path='users/' + user, mount_point='secret')
+              keys[user] = secret['data']['data']['ssh_pubkey']
+          except Exception as e:
+              print(f'Warning: could not fetch key for {user}: {e}')
+      print(json.dumps(keys))
+      " > /tmp/user_ssh_keys.json
+    - VM_IP=$(cat ${CI_PROJECT_DIR}/vm_ip.txt)
+    - VM_HOST=$(echo $VM_IP | cut -d'/' -f1)
+    - |
+      cat > ${ANSIBLE_ROOT}/inventory/hosts.yml << EOF
+      all:
+        hosts:
+          $[[ inputs.vm_name ]]:
+            ansible_host: ${VM_HOST}
+            ansible_user: ubuntu
+            ansible_ssh_private_key_file: /tmp/ansible_key
+      EOF
+  script:
+    - cd ${ANSIBLE_ROOT}
+    - |
+      ansible-playbook -i inventory/hosts.yml playbook.yml \
+        -e "{\"user_ssh_keys\": $(cat /tmp/user_ssh_keys.json)}"
+  after_script:
+    - |
+      VM_IP=$(cat ${CI_PROJECT_DIR}/vm_ip.txt 2>/dev/null || echo "unknown")
+      VM_HOST=$(echo $VM_IP | cut -d'/' -f1)
+      if [ "$CI_JOB_STATUS" = "success" ]; then
+        python3 -c "
+      import urllib.request, json, os
+      payload = {
+        'blocks': [
+          {'type': 'header', 'text': {'type': 'plain_text', 'text': '✅ VM Ready'}},
+          {'type': 'section', 'fields': [
+            {'type': 'mrkdwn', 'text': '*VM:*\n$[[ inputs.vm_name ]]'},
+            {'type': 'mrkdwn', 'text': '*IP:*\n${VM_HOST}'},
+            {'type': 'mrkdwn', 'text': '*Users created:*\nadmin, deployer'},
+            {'type': 'mrkdwn', 'text': '*Docker:*\nInstalled and running'}
+          ]},
+          {'type': 'section', 'text': {'type': 'mrkdwn', 'text': 'VM is fully configured and ready to use.'}}
+        ]
+      }
+      req = urllib.request.Request(
+        os.environ['SLACK_STATUS_WEBHOOK_URL'],
+        data=json.dumps(payload).encode(),
+        headers={'Content-Type': 'application/json'}
+      )
+      urllib.request.urlopen(req)
+      "
+      else
+        python3 -c "
+      import urllib.request, json, os
+      job_url = '${CI_PROJECT_URL}/-/jobs/${CI_JOB_ID}'
+      payload = {
+        'blocks': [
+          {'type': 'header', 'text': {'type': 'plain_text', 'text': '❌ Ansible Configuration Failed'}},
+          {'type': 'section', 'fields': [
+            {'type': 'mrkdwn', 'text': '*VM:*\n$[[ inputs.vm_name ]]'},
+            {'type': 'mrkdwn', 'text': '*IP:*\n${VM_HOST}'}
+          ]},
+          {'type': 'section', 'text': {'type': 'mrkdwn', 'text': 'VM was created but configuration failed. <' + job_url + '|View logs>'}}
+        ]
+      }
+      req = urllib.request.Request(
+        os.environ['SLACK_WEBHOOK_URL'],
+        data=json.dumps(payload).encode(),
+        headers={'Content-Type': 'application/json'}
+      )
+      urllib.request.urlopen(req)
+      "
+      fi
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web" && $ACTION == "apply"'
+      when: on_success
+
+# ── Destroy (web-triggered, action=destroy) ──────────────────────────────────
+
+notify:destroy:
+  stage: plan
+  image:
+    name: alpine:latest
+    entrypoint: [""]
+  tags: [proxmox]
+  before_script:
+    - apk add --no-cache curl --quiet
+  script:
+    - |
+      PIPELINE_URL="${CI_PROJECT_URL}/-/pipelines/${CI_PIPELINE_ID}"
+      curl -s -X POST "${SLACK_WEBHOOK_URL}" \
+        -H "Content-Type: application/json" \
+        -d "{
+          \"blocks\": [
+            {
+              \"type\": \"header\",
+              \"text\": {\"type\": \"plain_text\", \"text\": \"⚠️ VM Destroy Pending Approval\"}
+            },
+            {
+              \"type\": \"section\",
+              \"fields\": [
+                {\"type\": \"mrkdwn\", \"text\": \"*VM:*\n$[[ inputs.vm_name ]]\"},
+                {\"type\": \"mrkdwn\", \"text\": \"*IP:*\n$[[ inputs.vm_ip ]]\"},
+                {\"type\": \"mrkdwn\", \"text\": \"*Node:*\n$[[ inputs.proxmox_node ]]\"},
+                {\"type\": \"mrkdwn\", \"text\": \"*Requested by:*\n${GITLAB_USER_LOGIN}\"}
+              ]
+            },
+            {
+              \"type\": \"section\",
+              \"text\": {
+                \"type\": \"mrkdwn\",
+                \"text\": \"⚠️ *This will permanently delete the VM and remove it from Terraform state.*\n<${PIPELINE_URL}|Review and approve destroy>\"
+              }
+            }
+          ]
+        }"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web" && $ACTION == "destroy"'
+      when: always
+
+tf:destroy:
+  extends: .tf_base
+  stage: destroy
+  needs: [notify:destroy]
+  script:
+    - |
+      terraform destroy -auto-approve \
+        -var="vm_name=$[[ inputs.vm_name ]]" \
+        -var="vm_ip=$[[ inputs.vm_ip ]]" \
+        -var="vm_gateway=$[[ inputs.vm_gateway ]]" \
+        -var="template_vm_id=$[[ inputs.template_vm_id ]]" \
+        -var="proxmox_node=$[[ inputs.proxmox_node ]]" \
+        -var="vm_id=$[[ inputs.vm_id ]]" \
+        -var="vlan_id=$[[ inputs.vlan_id ]]"
+  after_script:
+    - |
+      if [ "$CI_JOB_STATUS" = "success" ]; then
+        EMOJI="🗑️"
+        TITLE="VM Destroyed"
+        DETAIL="VM \`$[[ inputs.vm_name ]]\` has been removed from Proxmox and Terraform state."
+      else
+        EMOJI="❌"
+        TITLE="Destroy Failed"
+        DETAIL="<${CI_PROJECT_URL}/-/jobs/${CI_JOB_ID}|View logs>"
+      fi
+      curl -s -X POST "${SLACK_STATUS_WEBHOOK_URL}" \
+        -H "Content-Type: application/json" \
+        -d "{
+          \"blocks\": [
+            {
+              \"type\": \"header\",
+              \"text\": {\"type\": \"plain_text\", \"text\": \"${EMOJI} ${TITLE}\"}
+            },
+            {
+              \"type\": \"section\",
+              \"fields\": [
+                {\"type\": \"mrkdwn\", \"text\": \"*VM:*\n$[[ inputs.vm_name ]]\"},
+                {\"type\": \"mrkdwn\", \"text\": \"*Destroyed by:*\n${GITLAB_USER_LOGIN}\"}
+              ]
+            },
+            {\"type\": \"section\", \"text\": {\"type\": \"mrkdwn\", \"text\": \"${DETAIL}\"}}
+          ]
+        }"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web" && $ACTION == "destroy"'
+      when: manual

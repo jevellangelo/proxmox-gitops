@@ -1,0 +1,35 @@
+# Installs and enables the QEMU guest agent.
+# Requires the VM to be created with agent enabled in Proxmox
+# (agent { enabled = true } in the Terraform module) — otherwise the
+# virtio-serial device doesn't exist and the service fails to start.
+# Supports Debian/Ubuntu (apt), RedHat/CentOS/Rocky/AlmaLinux (dnf), and Arch (pacman).
+
+- name: Install qemu-guest-agent (Debian/Ubuntu)
+  ansible.builtin.apt:
+    name: qemu-guest-agent
+    state: present
+    update_cache: true
+  when: ansible_facts['os_family'] == "Debian"
+
+- name: Install qemu-guest-agent (RedHat/CentOS/Rocky/AlmaLinux)
+  ansible.builtin.dnf:
+    name: qemu-guest-agent
+    state: present
+  when: ansible_facts['os_family'] == "RedHat"
+
+- name: Install qemu-guest-agent (Arch Linux)
+  community.general.pacman:
+    name: qemu-guest-agent
+    state: present
+  when: ansible_facts['os_family'] == "Archlinux"
+
+- name: Fail on unsupported OS family
+  ansible.builtin.fail:
+    msg: "Unsupported OS family: {{ ansible_facts['os_family'] }}"
+  when: ansible_facts['os_family'] not in ['Debian', 'RedHat', 'Archlinux']
+
+- name: Enable and start qemu-guest-agent
+  ansible.builtin.systemd:
+    name: qemu-guest-agent
+    enabled: true
+    state: started
